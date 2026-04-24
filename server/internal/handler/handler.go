@@ -143,6 +143,23 @@ func (h *Handler) resolveActor(r *http.Request, userID, workspaceID string) (act
 	return "agent", agentID
 }
 
+// actorCurrentIssueID returns the issue_id of the agent's currently running
+// task when X-Task-ID is present and valid, or "" otherwise. Used to scope
+// self-loop guards: an agent acting on its own assigned issue FROM a task on
+// that same issue is a loop, but an agent acting from a task on a DIFFERENT
+// issue is a hand-off and must still trigger pickup.
+func (h *Handler) actorCurrentIssueID(r *http.Request) string {
+	taskID := r.Header.Get("X-Task-ID")
+	if taskID == "" {
+		return ""
+	}
+	task, err := h.Queries.GetAgentTask(r.Context(), parseUUID(taskID))
+	if err != nil {
+		return ""
+	}
+	return uuidToString(task.IssueID)
+}
+
 func requireUserID(w http.ResponseWriter, r *http.Request) (string, bool) {
 	userID := requestUserID(r)
 	if userID == "" {
@@ -152,16 +169,15 @@ func requireUserID(w http.ResponseWriter, r *http.Request) (string, bool) {
 	return userID, true
 }
 
-func resolveWorkspaceID(r *http.Request) string {
-	// Prefer context value set by workspace middleware.
-	if id := middleware.WorkspaceIDFromContext(r.Context()); id != "" {
-		return id
-	}
-	workspaceID := r.URL.Query().Get("workspace_id")
-	if workspaceID != "" {
-		return workspaceID
-	}
-	return r.Header.Get("X-Workspace-ID")
+// resolveWorkspaceID returns the workspace UUID for this request. Delegates
+// to middleware.ResolveWorkspaceIDFromRequest so middleware-protected routes
+// and middleware-less routes (e.g. /api/upload-file) share identical
+// resolution behavior — including slug → UUID translation via the DB.
+//
+// Returns "" when no workspace identifier was provided or a slug was provided
+// but doesn't match any workspace.
+func (h *Handler) resolveWorkspaceID(r *http.Request) string {
+	return middleware.ResolveWorkspaceIDFromRequest(r, h.Queries)
 }
 
 // ctxMember returns the workspace member from context (set by workspace middleware).
@@ -272,7 +288,7 @@ func (h *Handler) loadIssueForUser(w http.ResponseWriter, r *http.Request, issue
 		return db.Issue{}, false
 	}
 
-	workspaceID := resolveWorkspaceID(r)
+	workspaceID := h.resolveWorkspaceID(r)
 	if workspaceID == "" {
 		writeError(w, http.StatusBadRequest, "workspace_id is required")
 		return db.Issue{}, false
@@ -362,7 +378,7 @@ func (h *Handler) loadAgentForUser(w http.ResponseWriter, r *http.Request, agent
 		return db.Agent{}, false
 	}
 
-	workspaceID := resolveWorkspaceID(r)
+	workspaceID := h.resolveWorkspaceID(r)
 	if workspaceID == "" {
 		writeError(w, http.StatusBadRequest, "workspace_id is required")
 		return db.Agent{}, false
@@ -385,7 +401,7 @@ func (h *Handler) loadInboxItemForUser(w http.ResponseWriter, r *http.Request, i
 		return db.InboxItem{}, false
 	}
 
-	workspaceID := resolveWorkspaceID(r)
+	workspaceID := h.resolveWorkspaceID(r)
 	if workspaceID == "" {
 		writeError(w, http.StatusBadRequest, "workspace_id is required")
 		return db.InboxItem{}, false

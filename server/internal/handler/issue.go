@@ -444,7 +444,7 @@ func buildSearchQuery(phrase string, terms []string, queryNum int, hasNum bool, 
 
 func (h *Handler) SearchIssues(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	workspaceID := resolveWorkspaceID(r)
+	workspaceID := h.resolveWorkspaceID(r)
 
 	q := r.URL.Query().Get("q")
 	if q == "" {
@@ -556,7 +556,7 @@ func (h *Handler) SearchIssues(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) ListIssues(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	workspaceID := resolveWorkspaceID(r)
+	workspaceID := h.resolveWorkspaceID(r)
 	wsUUID := parseUUID(workspaceID)
 
 	// Parse optional filter params
@@ -728,7 +728,7 @@ func (h *Handler) ListChildIssues(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ChildIssueProgress(w http.ResponseWriter, r *http.Request) {
-	wsID := resolveWorkspaceID(r)
+	wsID := h.resolveWorkspaceID(r)
 	wsUUID := parseUUID(wsID)
 
 	rows, err := h.Queries.ChildIssueProgress(r.Context(), wsUUID)
@@ -780,7 +780,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	workspaceID := resolveWorkspaceID(r)
+	workspaceID := h.resolveWorkspaceID(r)
 
 	// Get creator from context (set by auth middleware)
 	creatorID, ok := requireUserID(w, r)
@@ -1121,10 +1121,20 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Trigger the assigned agent when a member moves an issue out of backlog.
-	// Backlog acts as a parking lot — moving to an active status signals the
-	// issue is ready for work.
-	if statusChanged && !assigneeChanged && actorType == "member" &&
+	// Trigger the assigned agent when anyone (member or another agent) moves an
+	// issue out of backlog. Skip when the assignee agent moves its own issue
+	// to prevent self-loops. Exception: when the author agent is currently
+	// running a task on a DIFFERENT issue, the status change is a chained
+	// hand-off (e.g. agent finishing MOIK-12 sets MOIK-13 to todo where both
+	// are assigned to the same agent) and must still trigger pickup.
+	isSelfActor := actorType == "agent" && issue.AssigneeType.String == "agent" &&
+		uuidToString(issue.AssigneeID) == actorID
+	if isSelfActor {
+		if taskIssueID := h.actorCurrentIssueID(r); taskIssueID != "" && taskIssueID != uuidToString(issue.ID) {
+			isSelfActor = false
+		}
+	}
+	if statusChanged && !assigneeChanged && !isSelfActor &&
 		prevIssue.Status == "backlog" && issue.Status != "done" && issue.Status != "cancelled" {
 		if h.isAgentAssigneeReady(r.Context(), issue) {
 			h.TaskService.EnqueueTaskForIssue(r.Context(), issue)
@@ -1185,13 +1195,10 @@ func (h *Handler) shouldEnqueueAgentTask(ctx context.Context, issue db.Issue) bo
 }
 
 // shouldEnqueueOnComment returns true if a member comment on this issue should
-// trigger the assigned agent. Fires for any non-terminal status — comments are
-// conversational and can happen at any stage of active work.
+// trigger the assigned agent. Fires for any status — comments are
+// conversational and can happen at any stage, including after completion
+// (e.g. follow-up questions on a done issue).
 func (h *Handler) shouldEnqueueOnComment(ctx context.Context, issue db.Issue) bool {
-	// Don't trigger on terminal statuses (done, cancelled).
-	if issue.Status == "done" || issue.Status == "cancelled" {
-		return false
-	}
 	if !h.isAgentAssigneeReady(ctx, issue) {
 		return false
 	}
@@ -1291,7 +1298,7 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 		json.Unmarshal(raw, &rawUpdates)
 	}
 
-	workspaceID := resolveWorkspaceID(r)
+	workspaceID := h.resolveWorkspaceID(r)
 	updated := 0
 	for _, issueID := range req.IssueIDs {
 		prevIssue, err := h.Queries.GetIssueInWorkspace(r.Context(), db.GetIssueInWorkspaceParams{
@@ -1432,8 +1439,17 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Trigger agent when moving out of backlog (batch).
-		if statusChanged && !assigneeChanged && actorType == "member" &&
+		// Trigger agent when moving out of backlog (batch). Same rule as the
+		// single-update handler: self-loop unless the agent is currently
+		// running a task on a different issue (chained hand-off).
+		isSelfActorBatch := actorType == "agent" && issue.AssigneeType.String == "agent" &&
+			uuidToString(issue.AssigneeID) == actorID
+		if isSelfActorBatch {
+			if taskIssueID := h.actorCurrentIssueID(r); taskIssueID != "" && taskIssueID != uuidToString(issue.ID) {
+				isSelfActorBatch = false
+			}
+		}
+		if statusChanged && !assigneeChanged && !isSelfActorBatch &&
 			prevIssue.Status == "backlog" && issue.Status != "done" && issue.Status != "cancelled" {
 			if h.isAgentAssigneeReady(r.Context(), issue) {
 				h.TaskService.EnqueueTaskForIssue(r.Context(), issue)
@@ -1473,7 +1489,7 @@ func (h *Handler) BatchDeleteIssues(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	workspaceID := resolveWorkspaceID(r)
+	workspaceID := h.resolveWorkspaceID(r)
 	deleted := 0
 	for _, issueID := range req.IssueIDs {
 		issue, err := h.Queries.GetIssueInWorkspace(r.Context(), db.GetIssueInWorkspaceParams{

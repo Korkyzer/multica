@@ -325,6 +325,26 @@ func (s *TaskService) CompleteTask(ctx context.Context, taskID pgtype.UUID, resu
 		s.broadcastChatDone(ctx, task)
 	}
 
+	// Auto-advance issue to in_review when a non-chat issue task completes and
+	// the issue is still in an active state (the agent didn't set it manually).
+	if task.IssueID.Valid && !task.ChatSessionID.Valid {
+		if issue, err := s.Queries.GetIssue(ctx, task.IssueID); err == nil {
+			active := issue.Status != "in_review" && issue.Status != "done" && issue.Status != "cancelled"
+			if active {
+				updatedIssue, err := s.Queries.UpdateIssueStatus(ctx, db.UpdateIssueStatusParams{
+					ID:     task.IssueID,
+					Status: "in_review",
+				})
+				if err != nil {
+					slog.Warn("auto in_review failed", "task_id", util.UUIDToString(task.ID), "issue_id", util.UUIDToString(task.IssueID), "error", err)
+				} else {
+					s.broadcastIssueStatusUpdated(updatedIssue, issue.Status, "agent", util.UUIDToString(task.AgentID))
+					slog.Info("issue auto-advanced to in_review", "task_id", util.UUIDToString(task.ID), "issue_id", util.UUIDToString(task.IssueID))
+				}
+			}
+		}
+	}
+
 	// Reconcile agent status
 	s.ReconcileAgentStatus(ctx, task.AgentID)
 
@@ -479,7 +499,7 @@ func (s *TaskService) broadcastTaskDispatch(ctx context.Context, task db.AgentTa
 	payload["issue_id"] = util.UUIDToString(task.IssueID)
 	payload["agent_id"] = util.UUIDToString(task.AgentID)
 
-	workspaceID := s.resolveTaskWorkspaceID(ctx, task)
+	workspaceID := s.ResolveTaskWorkspaceID(ctx, task)
 	if workspaceID == "" {
 		return
 	}
@@ -493,7 +513,7 @@ func (s *TaskService) broadcastTaskDispatch(ctx context.Context, task db.AgentTa
 }
 
 func (s *TaskService) broadcastTaskEvent(ctx context.Context, eventType string, task db.AgentTaskQueue) {
-	workspaceID := s.resolveTaskWorkspaceID(ctx, task)
+	workspaceID := s.ResolveTaskWorkspaceID(ctx, task)
 	if workspaceID == "" {
 		return
 	}
@@ -515,10 +535,11 @@ func (s *TaskService) broadcastTaskEvent(ctx context.Context, eventType string, 
 	})
 }
 
-// resolveTaskWorkspaceID determines the workspace ID for a task.
+// ResolveTaskWorkspaceID determines the workspace ID for a task.
 // For issue tasks, it comes from the issue. For chat tasks, from the chat session.
 // For autopilot tasks, from the autopilot via its run.
-func (s *TaskService) resolveTaskWorkspaceID(ctx context.Context, task db.AgentTaskQueue) string {
+// Returns "" when none of the links resolve — callers treat that as "not found".
+func (s *TaskService) ResolveTaskWorkspaceID(ctx context.Context, task db.AgentTaskQueue) string {
 	if task.IssueID.Valid {
 		if issue, err := s.Queries.GetIssue(ctx, task.IssueID); err == nil {
 			return util.UUIDToString(issue.WorkspaceID)
@@ -540,7 +561,7 @@ func (s *TaskService) resolveTaskWorkspaceID(ctx context.Context, task db.AgentT
 }
 
 func (s *TaskService) broadcastChatDone(ctx context.Context, task db.AgentTaskQueue) {
-	workspaceID := s.resolveTaskWorkspaceID(ctx, task)
+	workspaceID := s.ResolveTaskWorkspaceID(ctx, task)
 	if workspaceID == "" {
 		return
 	}
@@ -564,6 +585,33 @@ func (s *TaskService) broadcastIssueUpdated(issue db.Issue) {
 		ActorType:   "system",
 		ActorID:     "",
 		Payload:     map[string]any{"issue": issueToMap(issue, prefix)},
+	})
+}
+
+func (s *TaskService) broadcastIssueStatusUpdated(issue db.Issue, oldStatus, actorType, actorID string) {
+	prefix := s.getIssuePrefix(issue.WorkspaceID)
+	s.Bus.Publish(events.Event{
+		Type:        protocol.EventIssueUpdated,
+		WorkspaceID: util.UUIDToString(issue.WorkspaceID),
+		ActorType:   actorType,
+		ActorID:     actorID,
+		Payload: map[string]any{
+			"issue":               issueToMap(issue, prefix),
+			"issue_id":            util.UUIDToString(issue.ID),
+			"status_changed":      oldStatus != issue.Status,
+			"old_status":          oldStatus,
+			"new_status":          issue.Status,
+			"prev_status":         oldStatus,
+			"assignee_changed":    false,
+			"priority_changed":    false,
+			"due_date_changed":    false,
+			"description_changed": false,
+			"title_changed":       false,
+			"creator_type":        issue.CreatorType,
+			"creator_id":          util.UUIDToString(issue.CreatorID),
+			"actor_type":          actorType,
+			"actor_id":            actorID,
+		},
 	})
 }
 

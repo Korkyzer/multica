@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useCallback, useEffect, useRef } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { cn } from "@multica/ui/lib/utils";
 import { AppLink, useNavigation } from "../navigation";
 import {
@@ -75,8 +75,8 @@ import { useModalStore } from "@multica/core/modals";
 import { useMyRuntimesNeedUpdate } from "@multica/core/runtimes/hooks";
 import { pinListOptions } from "@multica/core/pins/queries";
 import { useDeletePin, useReorderPins } from "@multica/core/pins/mutations";
-import type { PinnedItem, Workspace } from "@multica/core/types";
-import { clearWorkspaceStorage, defaultStorage } from "@multica/core/platform";
+import type { PinnedItem } from "@multica/core/types";
+import { useLogout } from "../auth";
 
 // Nav items reference WorkspacePaths method names so they can be resolved
 // against the current workspace slug at render time (see AppSidebar body).
@@ -139,7 +139,7 @@ function SortablePinItem({ pin, href, pathname, onUnpin }: { pin: PinnedItem; hr
       <SidebarMenuButton
         size="sm"
         isActive={isActive}
-        render={<AppLink href={href} />}
+        render={<AppLink href={href} draggable={false} />}
         onClick={(event) => {
           if (wasDragged.current) {
             wasDragged.current = false;
@@ -147,7 +147,10 @@ function SortablePinItem({ pin, href, pathname, onUnpin }: { pin: PinnedItem; hr
             return;
           }
         }}
-        className="text-muted-foreground hover:not-data-active:bg-sidebar-accent/70 data-active:bg-sidebar-accent data-active:text-sidebar-accent-foreground"
+        className={cn(
+          "text-muted-foreground hover:not-data-active:bg-sidebar-accent/70 data-active:bg-sidebar-accent data-active:text-sidebar-accent-foreground",
+          isDragging && "pointer-events-none",
+        )}
       >
         {pin.item_type === "issue" && pin.status ? (
           /* Override parent [&_svg]:size-4 — pinned items need smaller icons to match sm size */
@@ -196,7 +199,7 @@ export function AppSidebar({ topSlot, searchSlot, headerClassName, headerStyle }
   const { pathname, push } = useNavigation();
   const user = useAuthStore((s) => s.user);
   const userId = useAuthStore((s) => s.user?.id);
-  const authLogout = useAuthStore((s) => s.logout);
+  const logout = useLogout();
   const workspace = useCurrentWorkspace();
   const p = useWorkspacePaths();
   const { data: workspaces = [] } = useQuery(workspaceListOptions());
@@ -220,17 +223,35 @@ export function AppSidebar({ topSlot, searchSlot, headerClassName, headerStyle }
   const deletePin = useDeletePin();
   const reorderPins = useReorderPins();
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
+
+  // Local presentational copy of pinnedItems for drop-animation stability.
+  // Follows TQ at rest; frozen during a drag gesture so a mid-drag cache
+  // write (our own optimistic update, or a WS refetch) cannot reorder the
+  // DOM under dnd-kit while its drop animation is still interpolating.
+  const [localPinned, setLocalPinned] = useState<PinnedItem[]>(pinnedItems);
+  const isDraggingRef = useRef(false);
+  useEffect(() => {
+    if (!isDraggingRef.current) {
+      setLocalPinned(pinnedItems);
+    }
+  }, [pinnedItems]);
+
+  const handleDragStart = useCallback(() => {
+    isDraggingRef.current = true;
+  }, []);
   const handleDragEnd = useCallback(
     (event: DragEndEvent) => {
+      isDraggingRef.current = false;
       const { active, over } = event;
       if (!over || active.id === over.id) return;
-      const oldIndex = pinnedItems.findIndex((p) => p.id === active.id);
-      const newIndex = pinnedItems.findIndex((p) => p.id === over.id);
+      const oldIndex = localPinned.findIndex((p) => p.id === active.id);
+      const newIndex = localPinned.findIndex((p) => p.id === over.id);
       if (oldIndex === -1 || newIndex === -1) return;
-      const reordered = arrayMove(pinnedItems, oldIndex, newIndex);
+      const reordered = arrayMove(localPinned, oldIndex, newIndex);
+      setLocalPinned(reordered);
       reorderPins.mutate(reordered);
     },
-    [pinnedItems, reorderPins],
+    [localPinned, reorderPins],
   );
 
   const queryClient = useQueryClient();
@@ -262,28 +283,6 @@ export function AppSidebar({ topSlot, searchSlot, headerClassName, headerStyle }
       queryClient.invalidateQueries({ queryKey: workspaceKeys.myInvitations() });
     },
   });
-  const logout = () => {
-    // Clear workspace-scoped storage for every workspace this user has access to,
-    // before clearing the React Query cache (which holds the workspace list).
-    // Otherwise per-workspace drafts/chat/etc would leak to the next user on this device.
-    const cachedWorkspaces =
-      queryClient.getQueryData<Workspace[]>(workspaceKeys.list()) ?? [];
-    for (const ws of cachedWorkspaces) {
-      clearWorkspaceStorage(defaultStorage, ws.slug);
-    }
-    // Clear the last-workspace-slug cookie. Otherwise on a shared device the
-    // next user gets redirected by the proxy to the previous user's last
-    // workspace (then bounced to /onboarding by the layout — flash + confusing).
-    if (typeof document !== "undefined") {
-      document.cookie = "last_workspace_slug=; path=/; max-age=0; SameSite=Lax";
-    }
-    // Clear desktop tab state. Tab paths can contain issue UUIDs which must
-    // not survive across user sessions on a shared machine. No-op on web
-    // (web doesn't write this key).
-    defaultStorage.removeItem("multica_tabs");
-    queryClient.clear();
-    authLogout();
-  };
 
   // Global "C" shortcut to open create-issue modal (like Linear)
   useEffect(() => {
@@ -467,7 +466,7 @@ export function AppSidebar({ topSlot, searchSlot, headerClassName, headerStyle }
             </SidebarGroupContent>
           </SidebarGroup>
 
-          {pinnedItems.length > 0 && (
+          {localPinned.length > 0 && (
             <Collapsible defaultOpen>
               <SidebarGroup className="group/pinned">
                 <SidebarGroupLabel
@@ -476,14 +475,14 @@ export function AppSidebar({ topSlot, searchSlot, headerClassName, headerStyle }
                 >
                   <span>Pinned</span>
                   <ChevronRight className="!size-3 ml-1 stroke-[2.5] transition-transform duration-200 group-data-[panel-open]/trigger:rotate-90" />
-                  <span className="ml-auto text-[10px] text-muted-foreground opacity-0 transition-opacity group-hover/pinned:opacity-100">{pinnedItems.length}</span>
+                  <span className="ml-auto text-[10px] text-muted-foreground opacity-0 transition-opacity group-hover/pinned:opacity-100">{localPinned.length}</span>
                 </SidebarGroupLabel>
                 <CollapsibleContent>
                   <SidebarGroupContent>
-                    <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
-                      <SortableContext items={pinnedItems.map((p) => p.id)} strategy={verticalListSortingStrategy}>
+                    <DndContext sensors={sensors} collisionDetection={closestCenter} onDragStart={handleDragStart} onDragEnd={handleDragEnd}>
+                      <SortableContext items={localPinned.map((p) => p.id)} strategy={verticalListSortingStrategy}>
                         <SidebarMenu className="gap-0.5">
-                          {pinnedItems.map((pin: PinnedItem) => (
+                          {localPinned.map((pin: PinnedItem) => (
                             <SortablePinItem
                               key={pin.id}
                               pin={pin}
