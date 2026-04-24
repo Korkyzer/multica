@@ -331,12 +331,14 @@ func (s *TaskService) CompleteTask(ctx context.Context, taskID pgtype.UUID, resu
 		if issue, err := s.Queries.GetIssue(ctx, task.IssueID); err == nil {
 			active := issue.Status != "in_review" && issue.Status != "done" && issue.Status != "cancelled"
 			if active {
-				if _, err := s.Queries.UpdateIssueStatus(ctx, db.UpdateIssueStatusParams{
+				updatedIssue, err := s.Queries.UpdateIssueStatus(ctx, db.UpdateIssueStatusParams{
 					ID:     task.IssueID,
 					Status: "in_review",
-				}); err != nil {
+				})
+				if err != nil {
 					slog.Warn("auto in_review failed", "task_id", util.UUIDToString(task.ID), "issue_id", util.UUIDToString(task.IssueID), "error", err)
 				} else {
+					s.broadcastIssueStatusUpdated(updatedIssue, issue.Status, "agent", util.UUIDToString(task.AgentID))
 					slog.Info("issue auto-advanced to in_review", "task_id", util.UUIDToString(task.ID), "issue_id", util.UUIDToString(task.IssueID))
 				}
 			}
@@ -583,6 +585,33 @@ func (s *TaskService) broadcastIssueUpdated(issue db.Issue) {
 		ActorType:   "system",
 		ActorID:     "",
 		Payload:     map[string]any{"issue": issueToMap(issue, prefix)},
+	})
+}
+
+func (s *TaskService) broadcastIssueStatusUpdated(issue db.Issue, oldStatus, actorType, actorID string) {
+	prefix := s.getIssuePrefix(issue.WorkspaceID)
+	s.Bus.Publish(events.Event{
+		Type:        protocol.EventIssueUpdated,
+		WorkspaceID: util.UUIDToString(issue.WorkspaceID),
+		ActorType:   actorType,
+		ActorID:     actorID,
+		Payload: map[string]any{
+			"issue":               issueToMap(issue, prefix),
+			"issue_id":            util.UUIDToString(issue.ID),
+			"status_changed":      oldStatus != issue.Status,
+			"old_status":          oldStatus,
+			"new_status":          issue.Status,
+			"prev_status":         oldStatus,
+			"assignee_changed":    false,
+			"priority_changed":    false,
+			"due_date_changed":    false,
+			"description_changed": false,
+			"title_changed":       false,
+			"creator_type":        issue.CreatorType,
+			"creator_id":          util.UUIDToString(issue.CreatorID),
+			"actor_type":          actorType,
+			"actor_id":            actorID,
+		},
 	})
 }
 

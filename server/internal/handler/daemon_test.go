@@ -10,7 +10,9 @@ import (
 	"testing"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/middleware"
+	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
 func setHandlerTestWorkspaceRepos(t *testing.T, repos []map[string]string) {
@@ -41,6 +43,111 @@ func newDaemonTokenRequest(method, path string, body any, workspaceID, daemonID 
 	// No X-User-ID — daemon tokens don't set it.
 	ctx := middleware.WithDaemonContext(req.Context(), workspaceID, daemonID)
 	return req.WithContext(ctx)
+}
+
+func TestCompleteTaskAutoInReviewPublishesIssueUpdated(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	ctx := context.Background()
+
+	var agentID, runtimeID string
+	if err := testPool.QueryRow(ctx,
+		`SELECT id, runtime_id FROM agent WHERE workspace_id = $1 LIMIT 1`,
+		testWorkspaceID,
+	).Scan(&agentID, &runtimeID); err != nil {
+		t.Fatalf("setup: get agent: %v", err)
+	}
+
+	var issueID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type)
+		VALUES ($1, 'complete-task-event-test', 'todo', 'medium', $2, 'member')
+		RETURNING id
+	`, testWorkspaceID, testUserID).Scan(&issueID); err != nil {
+		t.Fatalf("setup: create issue: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, issueID) })
+
+	var taskID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (agent_id, issue_id, status, runtime_id, started_at)
+		VALUES ($1, $2, 'running', $3, now())
+		RETURNING id
+	`, agentID, issueID, runtimeID).Scan(&taskID); err != nil {
+		t.Fatalf("setup: create task: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, taskID) })
+
+	eventsCh := make(chan events.Event, 1)
+	testHandler.Bus.Subscribe(protocol.EventIssueUpdated, func(e events.Event) {
+		payload, ok := e.Payload.(map[string]any)
+		if !ok || payload["issue_id"] != issueID {
+			return
+		}
+		select {
+		case eventsCh <- e:
+		default:
+		}
+	})
+
+	if _, err := testHandler.TaskService.CompleteTask(ctx, parseUUID(taskID), []byte(`{}`), "", ""); err != nil {
+		t.Fatalf("CompleteTask: %v", err)
+	}
+
+	var status string
+	if err := testPool.QueryRow(ctx, `SELECT status FROM issue WHERE id = $1`, issueID).Scan(&status); err != nil {
+		t.Fatalf("read issue status: %v", err)
+	}
+	if status != "in_review" {
+		t.Fatalf("expected issue status in_review, got %q", status)
+	}
+
+	var evt events.Event
+	select {
+	case evt = <-eventsCh:
+	default:
+		t.Fatal("expected issue:updated event")
+	}
+
+	if evt.WorkspaceID != testWorkspaceID {
+		t.Fatalf("expected workspace_id %s, got %s", testWorkspaceID, evt.WorkspaceID)
+	}
+	if evt.ActorType != "agent" {
+		t.Fatalf("expected actor_type agent, got %s", evt.ActorType)
+	}
+	if evt.ActorID != agentID {
+		t.Fatalf("expected actor_id %s, got %s", agentID, evt.ActorID)
+	}
+
+	payload, ok := evt.Payload.(map[string]any)
+	if !ok {
+		t.Fatal("expected map payload")
+	}
+	if payload["issue_id"] != issueID {
+		t.Fatalf("expected issue_id %s, got %v", issueID, payload["issue_id"])
+	}
+	if payload["old_status"] != "todo" {
+		t.Fatalf("expected old_status todo, got %v", payload["old_status"])
+	}
+	if payload["new_status"] != "in_review" {
+		t.Fatalf("expected new_status in_review, got %v", payload["new_status"])
+	}
+	if payload["status_changed"] != true {
+		t.Fatalf("expected status_changed true, got %v", payload["status_changed"])
+	}
+
+	issue, ok := payload["issue"].(map[string]any)
+	if !ok {
+		t.Fatal("expected issue map payload")
+	}
+	if issue["id"] != issueID {
+		t.Fatalf("expected issue.id %s, got %v", issueID, issue["id"])
+	}
+	if issue["status"] != "in_review" {
+		t.Fatalf("expected issue.status in_review, got %v", issue["status"])
+	}
 }
 
 func TestDaemonRegister_WithDaemonToken(t *testing.T) {
