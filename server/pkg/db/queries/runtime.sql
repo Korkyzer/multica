@@ -90,13 +90,17 @@ DELETE FROM agent WHERE runtime_id = $1 AND archived_at IS NOT NULL;
 -- sensitive `=` would strand the old row; LOWER() on both sides handles drift
 -- without forcing the daemon to enumerate cased permutations.
 --
+-- Scoped by owner so a same-workspace daemon cannot fold another user's
+-- runtime into its newly registered row.
+--
 -- Returns many rather than one because case drift may have already minted
 -- duplicate rows historically (e.g. `Foo.local` AND `foo.local` under the
--- same workspace+provider). A single-row lookup would consolidate only one
--- of them and leave the rest orphaned. Callers must merge every returned
+-- same workspace+owner+provider). A single-row lookup would consolidate only
+-- one of them and leave the rest orphaned. Callers must merge every returned
 -- row into the new UUID-keyed runtime.
 SELECT * FROM agent_runtime
 WHERE workspace_id = @workspace_id
+  AND owner_id = @owner_id
   AND provider = @provider
   AND LOWER(daemon_id) = LOWER(@daemon_id);
 

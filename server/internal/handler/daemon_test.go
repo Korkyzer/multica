@@ -713,7 +713,9 @@ func TestDaemonRegister_MergesLegacyDaemonIDRuntime(t *testing.T) {
 	`, legacyAgentID, legacyIssueID, legacyRuntimeID).Scan(&legacyTaskID); err != nil {
 		t.Fatalf("seed legacy task: %v", err)
 	}
-	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, legacyTaskID) })
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, legacyTaskID)
+	})
 
 	// Register under the new stable UUID, declaring the prior hostname-derived
 	// id as legacy. The handler should merge the legacy row into the new one.
@@ -784,6 +786,112 @@ func TestDaemonRegister_MergesLegacyDaemonIDRuntime(t *testing.T) {
 	}
 }
 
+// TestDaemonRegister_DoesNotMergeLegacyDaemonIDRuntimeOwnedByDifferentUser
+// verifies that a matching legacy daemon_id in the same workspace is not enough
+// to merge runtime rows. The legacy runtime must also belong to the registering
+// user.
+func TestDaemonRegister_DoesNotMergeLegacyDaemonIDRuntimeOwnedByDifferentUser(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	ctx := context.Background()
+	const legacyDaemonID = "SharedMachine.local"
+	const newDaemonID = "0192a7a0-9ab3-7c3f-9f1c-4a6fe8c4e802"
+
+	var otherUserID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO "user" (name, email)
+		VALUES ('Other Runtime Owner', 'other-runtime-owner-' || gen_random_uuid() || '@example.com')
+		RETURNING id
+	`).Scan(&otherUserID); err != nil {
+		t.Fatalf("seed other user: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM member WHERE workspace_id = $1 AND user_id = $2`, testWorkspaceID, otherUserID)
+		testPool.Exec(context.Background(), `DELETE FROM "user" WHERE id = $1`, otherUserID)
+	})
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO member (workspace_id, user_id, role)
+		VALUES ($1, $2, 'member')
+	`, testWorkspaceID, otherUserID); err != nil {
+		t.Fatalf("seed other member: %v", err)
+	}
+
+	var legacyRuntimeID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_runtime (workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, owner_id, last_seen_at)
+		VALUES ($1, $2, 'foreign-owner-runtime', 'local', 'claude', 'offline', 'SharedMachine.local', '{}'::jsonb, $3, now() - interval '1 hour')
+		RETURNING id
+	`, testWorkspaceID, legacyDaemonID, otherUserID).Scan(&legacyRuntimeID); err != nil {
+		t.Fatalf("seed other owner legacy runtime: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM agent_runtime WHERE id = $1`, legacyRuntimeID)
+	})
+
+	var legacyAgentID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent (workspace_id, name, runtime_mode, runtime_config, runtime_id, visibility, max_concurrent_tasks, owner_id)
+		VALUES ($1, 'foreign-owner-agent', 'local', '{}'::jsonb, $2, 'private', 1, $3)
+		RETURNING id
+	`, testWorkspaceID, legacyRuntimeID, otherUserID).Scan(&legacyAgentID); err != nil {
+		t.Fatalf("seed other owner legacy agent: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM agent WHERE id = $1`, legacyAgentID)
+	})
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/daemon/register", map[string]any{
+		"workspace_id":      testWorkspaceID,
+		"daemon_id":         newDaemonID,
+		"legacy_daemon_ids": []string{legacyDaemonID},
+		"device_name":       "SharedMachine",
+		"runtimes": []map[string]any{
+			{"name": "current-owner-runtime", "type": "claude", "version": "1.0.0", "status": "online"},
+		},
+	})
+	testHandler.DaemonRegister(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("DaemonRegister: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	newRuntimeID := resp["runtimes"].([]any)[0].(map[string]any)["id"].(string)
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM agent_runtime WHERE id = $1`, newRuntimeID)
+	})
+
+	var legacyCount int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM agent_runtime WHERE id = $1`, legacyRuntimeID).Scan(&legacyCount); err != nil {
+		t.Fatalf("count other owner legacy runtime: %v", err)
+	}
+	if legacyCount != 1 {
+		t.Fatalf("expected other owner legacy runtime to remain, got count %d", legacyCount)
+	}
+
+	var agentRuntimeID string
+	if err := testPool.QueryRow(ctx, `SELECT runtime_id FROM agent WHERE id = $1`, legacyAgentID).Scan(&agentRuntimeID); err != nil {
+		t.Fatalf("read other owner agent runtime_id: %v", err)
+	}
+	if agentRuntimeID != legacyRuntimeID {
+		t.Fatalf("other owner agent was reassigned: got runtime_id=%s, want %s", agentRuntimeID, legacyRuntimeID)
+	}
+
+	var legacyTrace *string
+	if err := testPool.QueryRow(ctx, `SELECT legacy_daemon_id FROM agent_runtime WHERE id = $1`, newRuntimeID).Scan(&legacyTrace); err != nil {
+		t.Fatalf("read legacy_daemon_id: %v", err)
+	}
+	if legacyTrace != nil {
+		t.Fatalf("expected current owner runtime legacy_daemon_id to stay NULL, got %q", *legacyTrace)
+	}
+}
+
 // TestDaemonRegister_MergesLegacyDaemonIDRuntime_ReverseDotLocal covers the
 // direction missed by the initial implementation: the stored runtime row is
 // `host` (no `.local`) but the daemon's current `os.Hostname()` now returns
@@ -795,8 +903,8 @@ func TestDaemonRegister_MergesLegacyDaemonIDRuntime_ReverseDotLocal(t *testing.T
 	}
 
 	ctx := context.Background()
-	const legacyDaemonID = "ReverseDotLocalHost"                          // stored without .local
-	const emittedLegacyID = "ReverseDotLocalHost.local"                    // daemon now reports with .local
+	const legacyDaemonID = "ReverseDotLocalHost"        // stored without .local
+	const emittedLegacyID = "ReverseDotLocalHost.local" // daemon now reports with .local
 	const newDaemonID = "0192a7b0-0011-7ee9-9c21-30a5bcf86aa2"
 
 	var legacyRuntimeID string
@@ -853,8 +961,8 @@ func TestDaemonRegister_MergesLegacyDaemonIDRuntime_CaseDrift(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	const storedDaemonID = "Jiayuans-MacBook-Pro.local"     // DB has original mixed case
-	const emittedLegacyID = "jiayuans-macbook-pro.local"    // Daemon now reports lowercased
+	const storedDaemonID = "Jiayuans-MacBook-Pro.local"  // DB has original mixed case
+	const emittedLegacyID = "jiayuans-macbook-pro.local" // Daemon now reports lowercased
 	const newDaemonID = "0192a7b0-0022-7ee9-9c21-30a5bcf86aa3"
 
 	var legacyRuntimeID string

@@ -117,12 +117,14 @@ func (q *Queries) FailTasksForOfflineRuntimes(ctx context.Context) ([]FailTasksF
 const findLegacyRuntimesByDaemonID = `-- name: FindLegacyRuntimesByDaemonID :many
 SELECT id, workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, last_seen_at, created_at, updated_at, owner_id, legacy_daemon_id FROM agent_runtime
 WHERE workspace_id = $1
-  AND provider = $2
-  AND LOWER(daemon_id) = LOWER($3)
+  AND owner_id = $2
+  AND provider = $3
+  AND LOWER(daemon_id) = LOWER($4)
 `
 
 type FindLegacyRuntimesByDaemonIDParams struct {
 	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	OwnerID     pgtype.UUID `json:"owner_id"`
 	Provider    string      `json:"provider"`
 	DaemonID    string      `json:"daemon_id"`
 }
@@ -137,13 +139,21 @@ type FindLegacyRuntimesByDaemonIDParams struct {
 // sensitive `=` would strand the old row; LOWER() on both sides handles drift
 // without forcing the daemon to enumerate cased permutations.
 //
+// Scoped by owner so a same-workspace daemon cannot fold another user's
+// runtime into its newly registered row.
+//
 // Returns many rather than one because case drift may have already minted
 // duplicate rows historically (e.g. `Foo.local` AND `foo.local` under the
-// same workspace+provider). A single-row lookup would consolidate only one
-// of them and leave the rest orphaned. Callers must merge every returned
+// same workspace+owner+provider). A single-row lookup would consolidate only
+// one of them and leave the rest orphaned. Callers must merge every returned
 // row into the new UUID-keyed runtime.
 func (q *Queries) FindLegacyRuntimesByDaemonID(ctx context.Context, arg FindLegacyRuntimesByDaemonIDParams) ([]AgentRuntime, error) {
-	rows, err := q.db.Query(ctx, findLegacyRuntimesByDaemonID, arg.WorkspaceID, arg.Provider, arg.DaemonID)
+	rows, err := q.db.Query(ctx, findLegacyRuntimesByDaemonID,
+		arg.WorkspaceID,
+		arg.OwnerID,
+		arg.Provider,
+		arg.DaemonID,
+	)
 	if err != nil {
 		return nil, err
 	}

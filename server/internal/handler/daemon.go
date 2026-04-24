@@ -309,11 +309,10 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 // just the first. Per match we reassign agents and tasks, record the legacy
 // id on the new row for audit, then delete the stale row.
 //
-// Scoping by (workspace_id, provider) is sufficient since provider is single-
-// runtime-per-daemon; `unique (workspace_id, daemon_id, provider)` prevents
-// any two *exact* matches but the `LOWER(...)` comparison crosses that bound
-// precisely when case-duplicate rows exist — which is the bug we're fixing.
-// We also dedupe across legacy ids so overlapping candidates (e.g. `foo` and
+// Scoping by owner keeps a same-workspace daemon from folding another user's
+// runtime into its newly registered row. The lookup still returns many rows
+// because case-only drift can leave duplicate rows for the same owner. We also
+// dedupe across legacy ids so overlapping candidates (e.g. `foo` and
 // `foo.local` both resolving to the same stored row) don't double-process.
 func (h *Handler) mergeLegacyRuntimes(r *http.Request, registered db.AgentRuntime, provider string, legacyIDs []string) {
 	newID := uuidToString(registered.ID)
@@ -327,6 +326,7 @@ func (h *Handler) mergeLegacyRuntimes(r *http.Request, registered db.AgentRuntim
 
 		matches, err := h.Queries.FindLegacyRuntimesByDaemonID(r.Context(), db.FindLegacyRuntimesByDaemonIDParams{
 			WorkspaceID: registered.WorkspaceID,
+			OwnerID:     registered.OwnerID,
 			Provider:    provider,
 			DaemonID:    legacyID,
 		})
